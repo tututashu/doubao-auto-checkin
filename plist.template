@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  豆包自动签到 · launchd 配置模板（macOS）
+  不要直接用本文件 —— 运行 ./install.sh install 会把占位符替换后生成真实配置。
+
+  三种触发全部幂等（已签过只查询不重领）：
+    - StartCalendarInterval : 每天 __HOUR__:__MINUTE__ 正常签到
+    - StartInterval __POLL__ : 每 4 小时兜底轮询（定时那次撞上睡眠/关机时补上）
+    - RunAtLoad             : 开机/登录时补跑一次
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON3__</string>
+        <string>__SCRIPT_DIR__/checkin.py</string>
+        <string>run</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__SCRIPT_DIR__</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>__HOUR__</integer>
+        <key>Minute</key>
+        <integer>__MINUTE__</integer>
+    </dict>
+
+    <key>StartInterval</key>
+    <integer>__POLL__</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONIOENCODING</key>
+        <string>utf-8</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__SCRIPT_DIR__/data/launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__SCRIPT_DIR__/data/launchd.log</string>
+</dict>
+</plist>
