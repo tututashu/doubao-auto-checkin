@@ -1,0 +1,7 @@
+# 登录态与运行数据, 不要上传
+data/
+
+__pycache__/
+*.pyc
+.DS_Store
+*.log

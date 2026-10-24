@@ -1,0 +1,17 @@
+每天上午 9 点 20 分执行一次豆包自动签到，步骤如下：
+
+1. 打开终端，运行这条命令：
+   <python3> <仓库目录>/checkin.py run
+2. 命令会输出一行 JSON，把其中 report 字段的内容，直接一句话汇报给我。
+3. 如果 JSON 里 needs_attention 为 true，或者命令退出码非 0，额外提醒我处理：
+   - result 为 AUTH_ERROR 且 mode 为 client 时，提醒我「请打开豆包电脑版重新登录一次，再等下轮自动补签」。
+   - result 为 AUTH_ERROR 且 mode 不是 client 时，提醒我「需要手动运行 checkin.py login 重新登录」。
+   - 其他异常时，把 screenshot 字段里的截图路径告诉我。
+
+注意：脚本本身幂等，重复运行不会重复领取，不要绕过脚本自己去网页上点签到按钮；不要修改脚本内容，不要执行脚本以外的其他命令。
+
+---
+【使用说明（ humans 看，发给豆包前删掉本段）】
+- <仓库目录> → 替换为本仓库 clone 后的绝对路径，如 /Users/you/doubao-auto-checkin
+- <python3>  → 替换为 which python3 的实际输出（确保该 Python 装有 playwright）
+- 如果你是按 SETUP.md 流程由 AI 代为创建任务，占位符由 AI 自动替换，无需手动编辑
