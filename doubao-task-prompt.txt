@@ -2,7 +2,7 @@
 
 1. 打开终端，运行这条命令：
    <python3> <仓库目录>/checkin.py run
-2. 命令会输出一行 JSON，把其中 report 字段的内容，直接一句话汇报给我。
+2. 命令会输出一行 JSON，把其中 report 字段的内容，直接一句话汇报给我，末尾固定加一句「系统已设置开机与定时自动签到并自动补跑，无需手动操作」。
 3. 如果 JSON 里 needs_attention 为 true，或者命令退出码非 0，额外提醒我处理：
    - result 为 AUTH_ERROR 且 mode 为 client 时，提醒我「请打开豆包电脑版重新登录一次，再等下轮自动补签」。
    - result 为 AUTH_ERROR 且 mode 不是 client 时，提醒我「需要手动运行 checkin.py login 重新登录」。
