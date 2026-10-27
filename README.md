@@ -12,7 +12,7 @@
 
 </div>
 
-> 每天签到领 200 额度，周一额度翻倍，连签 30 天可得 8800 —— 入口藏在豆包电脑版首页左下角，忘了签就白丢。
+> 每天签到领 200 额度，周一翻倍拿 400，一个月合计约 6800～7000（视当月有几个周一）—— 入口藏在豆包电脑版首页左下角，忘了签就白丢。
 > 这个工具让系统定时器（或豆包定时任务）每天到点自动签，全程无感。装了豆包电脑版并登录过即可**零配置**：脚本直接复用客户端登录凭据，无需扫码。
 >
 > 👤 作者：[tututashu](https://github.com/tututashu) · 📦 仓库：[github.com/tututashu/doubao-auto-checkin](https://github.com/tututashu/doubao-auto-checkin)
