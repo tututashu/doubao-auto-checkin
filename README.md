@@ -145,7 +145,7 @@ powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
 | 触发 | 频率 | 干什么 |
 |---|---|---|
 | 每日定时 | 每天 09:20 | 正常签到（Windows 结果写 `data\checkin.log`；macOS 输出进 `data/launchd.log`） |
-| 兜底轮询 | 每 4 小时（Windows 为 01/05/09/13/17/21 六个独立触发） | 已签自动收手，没签就补上 |
+| 兜底轮询 | 每 4 小时（Windows 为 01/05/09/13/17/21 六个独立触发） | 未签就补上；当天签上后自动秒退（判日志、不启动浏览器），不再空耗 |
 | 开机/登录补跑 | 每次开机/登录 | 补上关机、睡眠期间错过的签到——凌晨 01/05 点的轮询撞上关机时，开机进桌面这一下立即补上 |
 
 三个触发跑的都是同一个幂等脚本——09:20 那次撞上关机、睡眠，或刚开机网络没就绪，轮询都会补上，当天 24 点前补到都有效。
@@ -194,7 +194,7 @@ python3 checkin.py run
 ```bash
 python3 checkin.py run          # 执行一次签到, 结果打印到 stdout (一行 JSON)
 python3 checkin.py silent       # 同 run, 但结果写入 data/checkin.log (配合定时任务静默运行)
-python3 checkin.py silent-poll  # 轮询补签: 已签过的空跑不写日志 (配合轮询任务)
+python3 checkin.py silent-poll  # 轮询补签: 未签才补; 当天签上后自动秒退, 不再空耗 (配合轮询任务)
 python3 checkin.py doctor       # 离线自检: 不联网, 逐项体检 (环境/浏览器/凭据/目录可写)
 python3 checkin.py login        # 备用: 手动登录保存网页登录态 (装有豆包客户端则无需此步)
 ./install.sh test               # 同 run, 顺便验证 launchd 所用 python 是否可用

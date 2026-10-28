@@ -6,7 +6,7 @@
 用法 (macOS / Linux 用 python3, Windows 用 python):
   python checkin.py run          # 日常运行: 无头签到, 结果打印到 stdout (供 AI 汇报)
   python checkin.py silent       # 同 run, 但结果写入日志文件而非 stdout (配合 Windows pythonw 静默运行)
-  python checkin.py silent-poll  # 轮询: 未签才补签; 已签过的空跑不写日志 (配合定时轮询任务)
+  python checkin.py silent-poll  # 轮询: 未签才补签; 当天签上后自动秒退, 不再空耗 (配合定时轮询任务)
   python checkin.py doctor       # 离线自检: 不联网, 检查 python/playwright/chromium/凭据/目录可写性
   python checkin.py login        # 备用: 手动登录保存网页登录态 (装了豆包客户端时通常不需要)
   python checkin.py run --url <活动页直链>   # 显式指定活动页 (默认 agent-explore)
@@ -213,6 +213,33 @@ def emit(out: dict, action: str) -> None:
             return
         except Exception:
             continue
+
+
+def _already_signed_today() -> bool:
+    """查今日日志里是否已有 success/already 结果。
+
+    供静默模式秒退用: 当天签上后, 轮询再触发也只是空耗 (读凭据 + 启动浏览器
+    + 打开页面要十几秒), 有这条守卫就在毫秒级结束。只认结果行
+    (emit 写入的 JSON, 行首是当天日期), 过程日志 (凭据模式/打开页面) 不算数。
+    """
+    today = datetime.date.today().isoformat()
+    paths = []
+    custom = os.environ.get("DOUBAO_CHECKIN_LOG")
+    if custom:
+        paths.append(pathlib.Path(custom))
+    paths.append(LOG_FILE)
+    for path in paths:
+        try:
+            if not path.is_file():
+                continue
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if not line.startswith(f"[{today} "):
+                    continue
+                if '"result": "success"' in line or '"result": "already"' in line:
+                    return True
+        except Exception:
+            continue
+    return False
 
 
 def goto_with_retry(page, url: str) -> bool:
@@ -789,6 +816,12 @@ def checkin(start_url: str, action: str) -> int:
 
     凭据源自动选择: 客户端凭据 (macOS 优先, 零配置) -> 网页登录态 data/profile。
     """
+    # 静默路径秒退守卫: 当天已成功签到就不再执行 (签上后的轮询毫秒级结束)。
+    # 只对 silent / silent-poll 生效; run 是验证入口, 始终完整执行给真实结果。
+    if action.startswith("silent") and _already_signed_today():
+        log("今日已签到成功, 本次静默执行跳过 (不启动浏览器)")
+        return 0
+
     client_cookies, client_reason = read_client_cookies()
     use_client = bool(client_cookies)
     log(f"凭据模式: {'客户端凭据' if use_client else '网页登录态'} ({client_reason})")
