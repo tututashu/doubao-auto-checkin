@@ -248,6 +248,7 @@ python3 checkin.py login        # 备用: 手动登录保存网页登录态 (装
 | `CHECKIN_POLL_SECONDS` | 兜底轮询间隔，默认 14400（4 小时） |
 | `DOUBAO_CHECKIN_LOG` | `silent` 类模式的结果日志路径，默认脚本目录下 `data/checkin.log` |
 | `DOUBAO_BUDGET_SECONDS` | 单次运行的时间预算，默认 480 秒。**必须小于定时任务的超时上限**，否则跑穿被系统强杀会死在写日志之前，当天记录整条丢失 |
+| `DOUBAO_PROFILE` | 客户端多账号时强制指定签到的 Profile 目录名（如 `Profile 1`）。默认**单账号模式**：按顺序只取第一个有登录态的 Profile——`Default`（主账号所在）天然排最前，其余 Profile 一律不碰，避免同名 Cookie 互相覆盖签错账号 |
 | `DOUBAO_CLIENT_UA_VERSION` | 客户端凭据模式的 UA 版本号（`SamanthaDoubao/<版本>`），默认 2.33.3；客户端升级后若遇 `CLIENT_ONLY` 可尝试同步更新 |
 | `checkin.py` 里的 `CLICK_TEXTS` | 签到按钮候选文案，豆包改版后在此补充 |
 

@@ -513,7 +513,7 @@ def _cache_unprotect(data: bytes) -> bytes | None:
 def _save_cookie_cache(cookies: list[dict]) -> None:
     """客户端凭据成功读取后把解密结果加密落盘; 失败静默, 不影响主流程。"""
     try:
-        blob = json.dumps({"saved_at": time.strftime("%Y-%m-%d %H:%M:%S"), "cookies": cookies},
+        blob = json.dumps({"v": 2, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"), "cookies": cookies},
                           ensure_ascii=False).encode("utf-8")
         enc = _cache_protect(blob)
         if enc:
@@ -532,6 +532,10 @@ def _load_cookie_cache() -> tuple[list[dict], str]:
         if not raw:
             return [], "凭据缓存解密失败 (可能更换了用户或机器)"
         obj = json.loads(raw.decode("utf-8"))
+        if obj.get("v") != 2:
+            # v1 缓存是多 Profile 合并的数据, 可能包含非主账号的 Cookie, 不能再用;
+            # 下次活读成功后会以 v2 格式自动重建。
+            return [], "凭据缓存为旧版格式 (已作废), 等下次成功读取后自动重建"
         now = time.time()
         cookies = [c for c in obj.get("cookies", [])
                    if c.get("expires", -1) == -1 or c.get("expires", 0) > now]
@@ -685,8 +689,11 @@ def _read_client_cookies_live() -> tuple[list[dict], str]:
     except Exception:
         return [], "缺少 pycryptodome, 安装: python -m pip install pycryptodome"
 
-    # 收集 (Cookie 库路径, 解密函数) 任务列表
-    jobs: list[tuple[pathlib.Path, object]] = []
+    # 收集 (Profile 标识, Cookie 库路径, 解密函数) 任务列表。
+    # 多账号机器上各 Profile 各有一个账号, 同名 Cookie 合并注入会互相覆盖、签错账号——
+    # 因此只取「第一个有登录态的 Profile」。Default (主账号所在) 按字典序排在
+    # Profile 1 等之前, 顺序天然正确; 可用环境变量 DOUBAO_PROFILE 强制指定。
+    jobs: list[tuple[str, pathlib.Path, object]] = []
     notes: list[str] = []
     if sys.platform == "darwin":
         if not CLIENT_DATA_DIR.exists():
@@ -698,7 +705,7 @@ def _read_client_cookies_live() -> tuple[list[dict], str]:
         for profile in sorted(CLIENT_DATA_DIR.glob("*")):
             db = profile / "Cookies"
             if db.is_file():
-                jobs.append((db, lambda blob, k=key: _decrypt_client_cookie(blob, k)))
+                jobs.append((profile.name, db, lambda blob, k=key: _decrypt_client_cookie(blob, k)))
         if not jobs:
             return [], "客户端目录里没有可读的 Cookie 库 (客户端可能未登录或已清空数据)"
     else:  # win32
@@ -711,13 +718,27 @@ def _read_client_cookies_live() -> tuple[list[dict], str]:
                 notes.append(f"{root.name}: Local State 密钥解密失败")
                 continue
             for db in sorted(root.glob("*/Cookies")) + sorted(root.glob("*/Network/Cookies")):
-                jobs.append((db, lambda blob, k=key: _decrypt_cookie_windows(blob, k)))
+                label = db.parent.name if db.parent.name != "Network" else db.parent.parent.name
+                jobs.append((label, db, lambda blob, k=key: _decrypt_cookie_windows(blob, k)))
         if not jobs:
             return [], ("Windows 客户端凭据不可用: " + ("; ".join(notes) or "无可读 Cookie 库")
                         + " (若客户端为 v20/App-Bound 加密则暂不支持, 请用 login 模式)")
 
+    forced = os.environ.get("DOUBAO_PROFILE", "").strip()
+    if forced:
+        matched = [j for j in jobs if j[0].lower() == forced.lower()]
+        if matched:
+            jobs = matched
+            notes.append(f"已按 DOUBAO_PROFILE 指定 Profile「{forced}」")
+        else:
+            names = ", ".join(sorted({j[0] for j in jobs}))
+            notes.append(f"DOUBAO_PROFILE={forced} 未匹配 (可用: {names}), 按默认顺序选取")
+
     cookies: list[dict] = []
-    for db, decrypt in jobs:
+    used_profile: str | None = None
+    for label, db, decrypt in jobs:
+        if used_profile is not None:
+            break  # 单账号模式: 第一个有登录态的 Profile 生效, 其余一律不碰
         try:
             tmp = pathlib.Path(tempfile.mkdtemp(prefix="doubao-ck-")) / "Cookies"
             try:
@@ -730,7 +751,7 @@ def _read_client_cookies_live() -> tuple[list[dict], str]:
                 if not _windows_esentutl_copy(db, tmp):
                     ok, vss_note = _windows_vss_copy(db, tmp)
                     if not ok:
-                        notes.append(f"{db.name}: 备份拷贝与卷影拷贝均失败 ({vss_note})")
+                        notes.append(f"{label}: 备份拷贝与卷影拷贝均失败 ({vss_note})")
                         continue
             con = sqlite3.connect(str(tmp))
             try:
@@ -743,6 +764,7 @@ def _read_client_cookies_live() -> tuple[list[dict], str]:
             tmp.unlink(missing_ok=True)
         except Exception:
             continue
+        profile_cookies: list[dict] = []
         for host, name, blob, path, secure, httponly, exp in rows:
             value = decrypt(blob)
             if not value:
@@ -752,16 +774,20 @@ def _read_client_cookies_live() -> tuple[list[dict], str]:
                 expires = int(exp / 1_000_000 - 11644473600)  # chromium 纪元 -> unix
                 if expires < 0:
                     expires = -1
-            cookies.append({
+            profile_cookies.append({
                 "name": name, "value": value, "domain": host, "path": path or "/",
                 "secure": bool(secure), "httpOnly": bool(httponly), "expires": expires,
             })
+        if profile_cookies:
+            cookies = profile_cookies
+            used_profile = label
     if not cookies:
         base = "客户端 Cookie 解密后为空 (客户端可能未登录或已清空数据)"
         if notes:
             base += "; " + "; ".join(notes)
         return [], base
-    return cookies, f"解密成功 {len(cookies)} 条"
+    prof = f"; 单账号 Profile「{used_profile}」" if used_profile else ""
+    return cookies, f"解密成功 {len(cookies)} 条{prof}"
 
 
 def _windows_elevated_rerun(action: str) -> int | None:
