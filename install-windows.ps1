@@ -150,7 +150,9 @@ try {
     $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive `
         -RunLevel Limited -ErrorAction Stop
 
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -Hidden `
+    # 刻意不用 -Hidden：任务在「任务计划程序」默认视图里可见、可随时手动停用，
+    # 保持透明可审计（豆包 AI 侧的安全策略也明确要求非隐藏任务）。
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
             -DontStopIfGoingOnBatteries -AllowStartIfOnBatteries `
             -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -ErrorAction Stop
 

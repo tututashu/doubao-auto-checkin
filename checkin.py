@@ -63,6 +63,8 @@ LOG_FILE = DATA_DIR / "checkin.log"
 # 客户端凭据加密缓存: 客户端运行时锁库读不到 Cookie, 用最近一次成功读取的凭据顶上
 # (Windows 用 DPAPI 加密 / macOS 用钥匙串密钥派生 AES 密钥, 本机当前用户之外不可解)
 CACHE_FILE = DATA_DIR / "client-cookies-cache.bin"
+# 最近一次签到结果的明文 JSON (每次 emit 覆盖写): 供豆包定时任务「零命令纯读汇报」用
+LAST_RESULT_FILE = DATA_DIR / "last-result.json"
 # run 模式提权重跑的结果回传文件: 提权子进程把结果写到这里, 原进程轮询读取后转述
 ELEVATED_RESULT_FILE = DATA_DIR / "elevated-run-result.json"
 
@@ -196,6 +198,15 @@ def emit(out: dict, action: str) -> None:
     global _LAST_RESULT
     _LAST_RESULT = out
     payload = json.dumps(out, ensure_ascii=False)
+    # 明文结果文件: 覆盖写, 内容只有本次结果 (不含凭据), 供 AI 定时任务只读汇报
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        snapshot = dict(out)
+        snapshot["saved_at"] = now_str()
+        LAST_RESULT_FILE.write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
     if not str(action).startswith("silent"):
         try:
             print(payload)
