@@ -63,6 +63,10 @@ LOG_FILE = DATA_DIR / "checkin.log"
 # 客户端凭据加密缓存: 客户端运行时锁库读不到 Cookie, 用最近一次成功读取的凭据顶上
 # (Windows 用 DPAPI 加密 / macOS 用钥匙串密钥派生 AES 密钥, 本机当前用户之外不可解)
 CACHE_FILE = DATA_DIR / "client-cookies-cache.bin"
+# 多账号配置: 文件不存在 = 单账号默认 (只签一个账号), 历史行为完全不变。
+# 只有用户在安装时通过对话式询问明确选择多账号, 才由 AI 写入本文件;
+# 脚本自身绝不擅自探测到多账号就自动多签。
+ACCOUNTS_FILE = DATA_DIR / "accounts.json"
 # 最近一次签到结果的明文 JSON (每次 emit 覆盖写): 供豆包定时任务「零命令纯读汇报」用
 LAST_RESULT_FILE = DATA_DIR / "last-result.json"
 # run 模式提权重跑的结果回传文件: 提权子进程把结果写到这里, 原进程轮询读取后转述
@@ -226,14 +230,79 @@ def emit(out: dict, action: str) -> None:
             continue
 
 
+def load_accounts_config() -> list[dict] | None:
+    """读多账号配置; 返回 None 表示「未启用多账号」, 调用方必须走单账号默认路径。
+
+    设计原则(重要): 多账号是用户显式授权的结果, 不是脚本的默认行为。
+    因此本函数只认 data/accounts.json 白纸黑字列出的 Profile, 任何解析异常、
+    字段缺失、空列表都一律当作「未配置」返回 None —— 宁可少签一个号,
+    也不能因为一个坏配置文件就擅自改变用户的账号范围。
+
+    文件格式:
+        {"version": 1,
+         "accounts": [{"profile": "Default", "label": "主号"},
+                      {"profile": "Profile 1", "label": "小号"}]}
+    label 只用于汇报措辞, 省略时回落到 profile 名。
+    """
+    try:
+        if not ACCOUNTS_FILE.is_file():
+            return None
+        obj = json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(obj, dict):
+            return None
+        raw = obj.get("accounts")
+        if not isinstance(raw, list) or not raw:
+            return None
+        out: list[dict] = []
+        seen: set[str] = set()
+        for item in raw:
+            if isinstance(item, str):  # 容错: 允许写成纯字符串列表
+                name = item.strip()
+                label = name
+            elif isinstance(item, dict):
+                name = str(item.get("profile") or "").strip()
+                label = str(item.get("label") or name).strip()
+            else:
+                continue
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            out.append({"profile": name, "label": label or name})
+        return out or None
+    except Exception:
+        return None
+
+
+def accounts_config_enabled() -> bool:
+    """是否已启用多账号 (含只列了一个号的配置)。"""
+    return load_accounts_config() is not None
+
+
+def _parse_result_line(line: str) -> dict | None:
+    """从日志行 `[时间] {json}` 里取出结果 JSON; 不是结果行返回 None。"""
+    i = line.find("{")
+    if i < 0:
+        return None
+    try:
+        obj = json.loads(line[i:])
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
 def _already_signed_today() -> bool:
     """查今日日志里是否已有 success/already 结果。
 
     供静默模式秒退用: 当天签上后, 轮询再触发也只是空耗 (读凭据 + 启动浏览器
     + 打开页面要十几秒), 有这条守卫就在毫秒级结束。只认结果行
     (emit 写入的 JSON, 行首是当天日期), 过程日志 (凭据模式/打开页面) 不算数。
+
+    多账号注意: 判据必须是「配置里的每个账号今天都有结果」而不是「任意一条」。
+    否则 A 号签上后, 还没签的 B 号会被这条守卫连带跳过, 全天不再补签。
     """
     today = datetime.date.today().isoformat()
+    cfg = load_accounts_config()
+    pending = {a["label"] for a in cfg} if cfg and len(cfg) > 1 else set()
     paths = []
     custom = os.environ.get("DOUBAO_CHECKIN_LOG")
     if custom:
@@ -246,8 +315,16 @@ def _already_signed_today() -> bool:
             for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
                 if not line.startswith(f"[{today} "):
                     continue
-                if '"result": "success"' in line or '"result": "already"' in line:
-                    return True
+                if '"result": "success"' not in line and '"result": "already"' not in line:
+                    continue
+                if not pending:
+                    return True  # 单账号: 任一成功结果即可秒退 (历史行为)
+                obj = _parse_result_line(line)
+                label = str((obj or {}).get("profile") or "").strip()
+                if label in pending:
+                    pending.discard(label)
+                    if not pending:
+                        return True
         except Exception:
             continue
     return False
@@ -521,10 +598,16 @@ def _cache_unprotect(data: bytes) -> bytes | None:
     return None
 
 
-def _save_cookie_cache(cookies: list[dict]) -> None:
-    """客户端凭据成功读取后把解密结果加密落盘; 失败静默, 不影响主流程。"""
+def _save_cookie_cache(accounts: list[dict]) -> None:
+    """客户端凭据成功读取后把解密结果按账号分组加密落盘; 失败静默, 不影响主流程。
+
+    v3 起按 Profile 分组保存: 多账号时每个账号各存一份, 绝不能合并成一个列表——
+    同名 Cookie (sessionid / sid_guard) 混在一起就分不清属于谁, 会签错号。
+    """
     try:
-        blob = json.dumps({"v": 2, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"), "cookies": cookies},
+        blob = json.dumps({"v": 3, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                           "accounts": [{"profile": a["profile"], "cookies": a["cookies"]}
+                                        for a in accounts if a.get("cookies")]},
                           ensure_ascii=False).encode("utf-8")
         enc = _cache_protect(blob)
         if enc:
@@ -534,8 +617,15 @@ def _save_cookie_cache(cookies: list[dict]) -> None:
         pass
 
 
+def _filter_live(cookies: list[dict]) -> list[dict]:
+    """丢掉已过期的 Cookie (expires == -1 表示会话 Cookie, 保留)。"""
+    now = time.time()
+    return [c for c in cookies
+            if c.get("expires", -1) == -1 or c.get("expires", 0) > now]
+
+
 def _load_cookie_cache() -> tuple[list[dict], str]:
-    """读取加密缓存并过滤已过期 Cookie; 不可用返回 ([], 原因)。"""
+    """读取加密缓存 → ([{profile, cookies}], 说明); 不可用返回 ([], 原因)。"""
     try:
         if not CACHE_FILE.is_file():
             return [], "无凭据缓存"
@@ -543,17 +633,28 @@ def _load_cookie_cache() -> tuple[list[dict], str]:
         if not raw:
             return [], "凭据缓存解密失败 (可能更换了用户或机器)"
         obj = json.loads(raw.decode("utf-8"))
-        if obj.get("v") != 2:
-            # v1 缓存是多 Profile 合并的数据, 可能包含非主账号的 Cookie, 不能再用;
-            # 下次活读成功后会以 v2 格式自动重建。
-            return [], "凭据缓存为旧版格式 (已作废), 等下次成功读取后自动重建"
-        now = time.time()
-        cookies = [c for c in obj.get("cookies", [])
-                   if c.get("expires", -1) == -1 or c.get("expires", 0) > now]
-        if not cookies:
-            return [], "凭据缓存已全部过期"
-        return cookies, (f"来自本机加密缓存 (缓存于 {obj.get('saved_at', '?')}; "
-                         "客户端 Cookie 库当前不可读, 下次成功读取后自动刷新)")
+        ver = obj.get("v")
+        if ver == 3:
+            accounts = []
+            for item in obj.get("accounts", []):
+                cookies = _filter_live(item.get("cookies", []))
+                if cookies:
+                    accounts.append({"profile": item.get("profile") or "缓存账号", "cookies": cookies})
+            if not accounts:
+                return [], "凭据缓存已全部过期"
+            return accounts, (f"来自本机加密缓存 (缓存于 {obj.get('saved_at', '?')}; "
+                              "客户端 Cookie 库当前不可读, 下次成功读取后自动刷新)")
+        if ver == 2:
+            # v2 是单账号数据 (当时只保存第一个有登录态的 Profile), 可继续用;
+            # 但 Profile 名没记录, 用中性标签, 避免冒充成 Default。
+            cookies = _filter_live(obj.get("cookies", []))
+            if not cookies:
+                return [], "凭据缓存已全部过期"
+            return ([{"profile": "缓存账号", "cookies": cookies}],
+                    (f"来自本机加密缓存 v2 (单账号, 缓存于 {obj.get('saved_at', '?')}); "
+                     "下次成功读取后自动升级为按账号分组"))
+        # v1 是多 Profile 合并的数据, 可能包含非主账号的 Cookie, 不能再用
+        return [], "凭据缓存为旧版格式 (已作废), 等下次成功读取后自动重建"
     except Exception as exc:
         return [], f"凭据缓存读取失败: {exc}"
 
@@ -671,23 +772,63 @@ def _windows_vss_copy(db: pathlib.Path, tmp: pathlib.Path) -> tuple[bool, str]:
         return False, f"VSS 不可用: {type(exc).__name__}: {exc}"
 
 
+def read_client_accounts() -> tuple[list[dict], str, list[str]]:
+    """客户端凭据读取入口(多账号): 返回 (账号列表, 说明, 配置里读不到的 Profile 名)。
+
+    账号列表每项 {"profile": 原始 Profile 名, "label": 汇报用名, "cookies": [...]}。
+
+    账号范围由 data/accounts.json 决定:
+      - 文件不存在 → 单账号模式, 只取「第一个有登录态的 Profile」(历史行为, Default 字典序在前)
+      - 文件存在   → 严格按配置列出的号来签, 顺序按配置, 绝不回落到配置外的账号
+                     (否则「配置了 A 和 B 却签了 C」比不签更糟)
+    missing 是配置里点名但磁盘上读不到的 Profile, 调用方必须把它计入汇报, 不能静默跳过。
+    """
+    live, reason = _read_client_accounts_live()
+    if live:
+        _save_cookie_cache(live)
+    else:
+        live, cache_note = _load_cookie_cache()
+        if live:
+            reason = cache_note
+    if not live:
+        return [], reason, []
+
+    cfg = load_accounts_config()
+    if not cfg:
+        first = live[0]
+        return ([{"profile": first["profile"], "label": first["profile"],
+                  "cookies": first["cookies"]}],
+                f"单账号模式, 本次只签「{first['profile']}」({reason})", [])
+
+    by_name = {a["profile"].lower(): a for a in live}
+    out: list[dict] = []
+    missing: list[str] = []
+    for want in cfg:
+        hit = by_name.get(want["profile"].lower())
+        if hit:
+            out.append({"profile": hit["profile"], "label": want["label"], "cookies": hit["cookies"]})
+        else:
+            missing.append(want["profile"])
+    return out, f"{reason} (多账号模式: 配置 {len(cfg)} 个, 读到 {len(out)} 个)", missing
+
+
 def read_client_cookies() -> tuple[list[dict], str]:
-    """客户端凭据读取入口: 先活读客户端库, 失败回落本机加密缓存。"""
-    cookies, reason = _read_client_cookies_live()
-    if cookies:
-        _save_cookie_cache(cookies)
-        return cookies, reason
-    cached, cache_note = _load_cookie_cache()
-    if cached:
-        return cached, cache_note
+    """单账号兼容入口 (doctor 与老调用点): 返回第一个账号的 Cookie。"""
+    accounts, reason, _missing = read_client_accounts()
+    if accounts:
+        return accounts[0]["cookies"], reason
     return [], reason
 
 
-def _read_client_cookies_live() -> tuple[list[dict], str]:
+def _read_client_accounts_live() -> tuple[list[dict], str]:
     """读取豆包电脑版客户端的登录 Cookie (macOS / Windows 均已实测)。
 
-    返回 (cookies, reason): cookies 为空列表时 reason 说明原因。
+    返回 ([{profile, cookies}], reason): 列表为空时 reason 说明原因。
     只读取, 解密在内存完成, Cookie 值不打印、不落盘。
+
+    多账号: 逐个 Profile 各自解密成独立的一份, 由调用方决定签哪些。
+    每个账号必须各自独立注入到一个干净的浏览器上下文——同名 Cookie 合并
+    在一起会互相覆盖, 那是签错账号的根源。
     """
     import shutil
     import sqlite3
@@ -701,9 +842,10 @@ def _read_client_cookies_live() -> tuple[list[dict], str]:
         return [], "缺少 pycryptodome, 安装: python -m pip install pycryptodome"
 
     # 收集 (Profile 标识, Cookie 库路径, 解密函数) 任务列表。
-    # 多账号机器上各 Profile 各有一个账号, 同名 Cookie 合并注入会互相覆盖、签错账号——
-    # 因此只取「第一个有登录态的 Profile」。Default (主账号所在) 按字典序排在
-    # Profile 1 等之前, 顺序天然正确; 可用环境变量 DOUBAO_PROFILE 强制指定。
+    # 每个 Profile 各自独立解密: 多账号机器上各 Profile 各有一个账号,
+    # 同名 Cookie 合并注入会互相覆盖、签错账号, 所以绝不能合并成一个列表。
+    # 未启用多账号时, 调用方只取第一个 (Default 按字典序排在 Profile 1 之前);
+    # 环境变量 DOUBAO_PROFILE 可强制只读某一个 Profile (调试用)。
     jobs: list[tuple[str, pathlib.Path, object]] = []
     notes: list[str] = []
     if sys.platform == "darwin":
@@ -745,11 +887,8 @@ def _read_client_cookies_live() -> tuple[list[dict], str]:
             names = ", ".join(sorted({j[0] for j in jobs}))
             notes.append(f"DOUBAO_PROFILE={forced} 未匹配 (可用: {names}), 按默认顺序选取")
 
-    cookies: list[dict] = []
-    used_profile: str | None = None
+    accounts: list[dict] = []
     for label, db, decrypt in jobs:
-        if used_profile is not None:
-            break  # 单账号模式: 第一个有登录态的 Profile 生效, 其余一律不碰
         try:
             tmp = pathlib.Path(tempfile.mkdtemp(prefix="doubao-ck-")) / "Cookies"
             try:
@@ -790,15 +929,15 @@ def _read_client_cookies_live() -> tuple[list[dict], str]:
                 "secure": bool(secure), "httpOnly": bool(httponly), "expires": expires,
             })
         if profile_cookies:
-            cookies = profile_cookies
-            used_profile = label
-    if not cookies:
+            accounts.append({"profile": label, "cookies": profile_cookies})
+    if not accounts:
         base = "客户端 Cookie 解密后为空 (客户端可能未登录或已清空数据)"
         if notes:
             base += "; " + "; ".join(notes)
         return [], base
-    prof = f"; 单账号 Profile「{used_profile}」" if used_profile else ""
-    return cookies, f"解密成功 {len(cookies)} 条{prof}"
+    names = "、".join(f"{a['profile']}({len(a['cookies'])} 条)" for a in accounts)
+    extra = f"; {'; '.join(notes)}" if notes else ""
+    return accounts, f"解密成功 {len(accounts)} 个账号: {names}{extra}"
 
 
 def _windows_elevated_rerun(action: str) -> int | None:
@@ -848,20 +987,109 @@ def _windows_elevated_rerun(action: str) -> int | None:
     return None
 
 
-def checkin(start_url: str, action: str) -> int:
-    """run / silent / silent-poll 三条路径的共用实现。
+def _log_result(out: dict) -> None:
+    """只写日志: 不覆盖 last-result.json、不打印。供多账号逐条留痕用。
 
-    凭据源自动选择: 客户端凭据 (macOS 优先, 零配置) -> 网页登录态 data/profile。
+    last-result.json 只存聚合后的那一条 (豆包定时任务读它), 逐账号明细进日志,
+    既让汇报只看到一句结论, 又留下排查依据。
     """
-    # 静默路径秒退守卫: 当天已成功签到就不再执行 (签上后的轮询毫秒级结束)。
-    # 只对 silent / silent-poll 生效; run 是验证入口, 始终完整执行给真实结果。
-    if action.startswith("silent") and _already_signed_today():
-        log("今日已签到成功, 本次静默执行跳过 (不启动浏览器)")
-        return 0
+    line = f"[{now_str()}] {json.dumps(out, ensure_ascii=False)}\n"
+    custom = os.environ.get("DOUBAO_CHECKIN_LOG")
+    for path in ([pathlib.Path(custom)] if custom else []) + [LOG_FILE]:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            rotate_log()
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+            return
+        except Exception:
+            continue
 
-    client_cookies, client_reason = read_client_cookies()
+
+# 多账号聚合汇报用的短文案: REPORTS 的完整说明太长, 塞进一句话会把结论淹没
+BRIEF_RESULTS = {
+    "success": "签到成功",
+    "already": "今日已签到",
+    "AUTH_ERROR": "需在豆包电脑版重新登录",
+    "NETWORK": "网络不可达, 稍后自动补",
+    "CLIENT_ONLY": "被活动页拦截",
+    "TIMEOUT": "本轮超时, 稍后自动补",
+    "unknown": "结果未确认, 见截图",
+    "NO_CREDENTIAL": "读不到凭据",
+    "BROWSER": "浏览器环境异常",
+    "ERROR": "运行异常",
+}
+
+
+def _notify_brief(text: str) -> str:
+    """系统通知正文太长会被截断, 这里主动收一收, 保证结论先看到。"""
+    return text if len(text) <= 60 else text[:57] + "…"
+
+
+def _aggregate_results(results: list[tuple[int, dict, str]]) -> tuple[int, dict]:
+    """把逐账号结果聚合成一条汇报。
+
+    result 取「最差」的那个 (有失败就报失败), needs_attention 任一失败即为真;
+    report 里逐个列明账号名与简短结论, 这样豆包定时任务只读 report 也能说清多账号。
+    """
+    n = len(results)
+    done = [r for r in results if r[1].get("result") in ("success", "already")]
+    bad = [r for r in results if r[1].get("result") not in ("success", "already")]
+    parts = [f"{label} {BRIEF_RESULTS.get(str(out.get('result')), out.get('result'))}"
+             for _code, out, label in results]
+    if bad:
+        head = f"{n} 个账号: {len(done)} 个已完成、{len(bad)} 个需要处理"
+    else:
+        head = f"{n} 个账号均已签到"
+    if bad:
+        result = str(bad[0][1].get("result"))
+    elif any(out.get("result") == "success" for _c, out, _l in results):
+        result = "success"
+    else:
+        result = "already"
+    out = {
+        "result": result,
+        "report": head + ": " + "、".join(parts),
+        "mode": "client",
+        "needs_attention": bool(bad),
+        "accounts": [{"profile": label, "result": o.get("result")} for _c, o, label in results],
+    }
+    return (bad[0][0] if bad else 0), out
+
+
+def _missing_result(name: str) -> dict:
+    """配置里点名、但本机读不到登录态的账号的结果 (不打印凭据, 只说明事实)。"""
+    return {"result": "AUTH_ERROR", "needs_attention": True, "profile": name,
+            "report": "配置里的账号在本机读不到登录态 (可能已被客户端清除登录)"}
+
+
+def _checkin_one(start_url: str, action: str, client_cookies: list[dict] | None,
+                 label: str | None, standalone: bool) -> tuple[int, dict]:
+    """对单个账号执行一次签到。
+
+    standalone=True  —— 自己 emit 结果并弹通知 (单账号路径, 输出格式与历史版本一致)
+    standalone=False —— 只返回结果, 交给调度层聚合成一条汇报 (多账号路径)
+
+    每个账号都在自己的 sync_playwright + 独立 context 里跑, 绝不共用:
+    两个账号的 Cookie 同名 (sessionid / sid_guard), 混进同一个 context 会互相
+    覆盖, 结果是拿 A 的登录态去签 B 的号。
+    """
     use_client = bool(client_cookies)
-    log(f"凭据模式: {'客户端凭据' if use_client else '网页登录态'} ({client_reason})")
+    mode = "client" if use_client else "profile"
+
+    def finish(out: dict, code: int, notify_msg: str | None = None) -> tuple[int, dict]:
+        out = dict(out)
+        out.setdefault("report", REPORTS.get(str(out.get("result")), ""))
+        out["mode"] = mode
+        if label:
+            out["profile"] = label
+        if standalone:
+            skip = (action == "silent-poll" and out.get("result") == "already")
+            if not skip:
+                emit(out, action)
+            if notify_msg:
+                notify("豆包签到", notify_msg)
+        return code, out
 
     # Windows 立即验证场景: 客户端运行中锁库且缓存尚未建立, 凭据当场读不到。
     # 仅 run 模式 (AI/人工驱动的验证) 自动弹一次 UAC 提权重跑, 用 VSS 卷影
@@ -870,29 +1098,29 @@ def checkin(start_url: str, action: str) -> int:
             and "--elevated-child" not in sys.argv):
         handled = _windows_elevated_rerun(action)
         if handled is not None:
-            return handled
+            return handled, {"result": "ERROR", "report": "已以管理员权限重跑一次",
+                             "needs_attention": True}
 
     if not use_client:
         has_profile = PROFILE_DIR.exists() and any(PROFILE_DIR.iterdir())
         if not has_profile:
-            log(f"无可用凭据: {client_reason}; 且 data/profile 不存在")
-            emit({"result": "NO_CREDENTIAL", "report": REPORTS["NO_CREDENTIAL"],
-                  "detail": client_reason}, action)
-            notify("豆包签到", "无可用凭据: 需要豆包客户端或手动 login")
-            return 5
+            log("无可用凭据: 客户端凭据读不到; 且 data/profile 不存在")
+            return finish({"result": "NO_CREDENTIAL", "report": REPORTS["NO_CREDENTIAL"],
+                           "detail": "无客户端凭据, 且 data/profile 不存在"}, 5,
+                          "无可用凭据: 需要豆包客户端或手动 login")
 
     with sync_playwright() as p:
         if use_client:
-            # 客户端凭据模式: 普通 context + 注入 Cookie + 客户端标识 UA
+            # 客户端凭据模式: 普通 context + 注入本账号 Cookie + 客户端标识 UA
             browser = p.chromium.launch(headless=True, channel="chromium")
             ctx = browser.new_context(
                 user_agent=CLIENT_UA,
                 viewport={"width": 1280, "height": 900},
                 locale="zh-CN",
             )
-            ctx.add_cookies(client_cookies)
+            ctx.add_cookies(client_cookies or [])
         else:
-            # 网页登录态模式: 持久化 profile
+            # 网页登录态模式: 持久化 profile (仅单账号)
             browser = None
             ctx = p.chromium.launch_persistent_context(
                 user_data_dir=str(PROFILE_DIR),
@@ -907,9 +1135,8 @@ def checkin(start_url: str, action: str) -> int:
 
             log(f"打开页面: {start_url}")
             if not goto_with_retry(page, start_url):
-                emit({"result": "NETWORK", "report": REPORTS["NETWORK"]}, action)
-                notify("豆包签到", "网络不可达, 稍后轮询会自动补签")
-                return 3
+                return finish({"result": "NETWORK", "report": REPORTS["NETWORK"]}, 3,
+                              "网络不可达, 稍后轮询会自动补签")
 
             page.wait_for_timeout(3000)
 
@@ -921,11 +1148,9 @@ def checkin(start_url: str, action: str) -> int:
                 SHOT_DIR.mkdir(parents=True, exist_ok=True)
                 page.screenshot(path=str(shot))
                 log("活动仅限豆包电脑版客户端参与, 当前通道被拦截")
-                emit({"result": "CLIENT_ONLY", "report": REPORTS["CLIENT_ONLY"],
-                      "mode": "client" if use_client else "profile",
-                      "screenshot": str(shot)}, action)
-                notify("豆包签到", "活动仅限电脑版客户端参与, 当前通道被拦")
-                return 4
+                return finish({"result": "CLIENT_ONLY", "report": REPORTS["CLIENT_ONLY"],
+                               "screenshot": str(shot)}, 4,
+                              "活动仅限电脑版客户端参与, 当前通道被拦")
 
             # 登录态检查: 未登录时页面一般会出现「扫码登录」字样
             if "扫码登录" in body or ("登录" in body and "立即领取" not in body and "签到" not in body):
@@ -937,11 +1162,9 @@ def checkin(start_url: str, action: str) -> int:
                 else:
                     hint = f"登录态失效, 请先运行: python {pathlib.Path(__file__).name} login"
                 log(f"{hint} (截图: {shot})")
-                emit({"result": "AUTH_ERROR", "report": REPORTS["AUTH_ERROR"],
-                      "mode": "client" if use_client else "profile",
-                      "detail": hint, "screenshot": str(shot)}, action)
-                notify("豆包签到", "登录态失效, 请重新登录")
-                return 2
+                return finish({"result": "AUTH_ERROR", "report": REPORTS["AUTH_ERROR"],
+                               "detail": hint, "screenshot": str(shot)}, 2,
+                              "登录态失效, 请重新登录")
 
             # 幂等前置: 未进点击流程前先判已签 (误点按钮可能触发不可逆动作)
             pre = check_success(page)
@@ -950,11 +1173,9 @@ def checkin(start_url: str, action: str) -> int:
                 SHOT_DIR.mkdir(parents=True, exist_ok=True)
                 page.screenshot(path=str(shot), full_page=False)
                 log(f"幂等前置命中: 今日已签过, 跳过点击 (截图: {shot})")
-                emit({"result": "already", "report": REPORTS["already"],
-                      "mode": "client" if use_client else "profile",
-                      "needs_attention": False, "screenshot": str(shot)}, action)
-                notify("豆包签到", "今天已经签过啦")
-                return 0
+                return finish({"result": "already", "report": REPORTS["already"],
+                               "needs_attention": False, "screenshot": str(shot)}, 0,
+                              "今天已经签过啦")
 
             clicked = find_and_click(page)
             page.wait_for_timeout(2500)
@@ -977,28 +1198,29 @@ def checkin(start_url: str, action: str) -> int:
                         continue
 
             result = check_success(page)
+            # 修历史误判: 走到这里的 pre 必然不是 already, 点击后却变成 already,
+            # 说明「立即签到」按钮是在这次点击后消失的 —— 也就是这次真的签上了。
+            # (旧逻辑记成 already, 多账号汇报里就看不出哪个号是本次签的)
+            if result == "already" and clicked:
+                result = "success"
+
             shot = SHOT_DIR / f"result-{datetime.datetime.now():%Y%m%d-%H%M%S}.png"
             SHOT_DIR.mkdir(parents=True, exist_ok=True)
             page.screenshot(path=str(shot), full_page=False)
             log(f"签到结果: {result} (截图: {shot})")
 
             out = {"result": result, "report": REPORTS[result],
-                   "mode": "client" if use_client else "profile",
                    "needs_attention": result in NEEDS_ATTENTION_CODES, "screenshot": str(shot)}
-            # 轮询模式的空跑(已签过)不写日志, 防止有价值的记录被淹没; 其余结果正常输出
             if action == "silent-poll" and result == "already":
                 log("轮询空跑: 今日已签过, 不落盘")
-            else:
-                emit(out, action)
 
             if result == "success":
-                notify("豆包签到", "签到成功, 额度已到账")
+                msg = "签到成功, 额度已到账"
             elif result == "already":
-                notify("豆包签到", "今天已经签过啦")
+                msg = "今天已经签过啦"
             else:
-                notify("豆包签到", f"结果未确认, 请查看截图 {shot.name}")
-
-            return 0 if result in ("success", "already") else 1
+                msg = f"结果未确认, 请查看截图 {shot.name}"
+            return finish(out, 0 if result in ("success", "already") else 1, msg)
         finally:
             try:
                 ctx.close()
@@ -1006,6 +1228,225 @@ def checkin(start_url: str, action: str) -> int:
                     browser.close()
             except Exception:
                 pass
+
+
+def checkin(start_url: str, action: str) -> int:
+    """run / silent / silent-poll 三条路径的入口, 单账号与多账号都在这里分流。
+
+    账号范围由 data/accounts.json 决定 (见 load_accounts_config):
+      - 未配置 → 单账号, 只签第一个有登录态的 Profile, 输出格式与历史版本一致
+      - 已配置 → 只签配置里列出的账号, 逐个独立签到后聚合成一条汇报
+    """
+    # 静默路径秒退守卫: 当天已成功签到就不再执行 (签上后的轮询毫秒级结束)。
+    # 只对 silent / silent-poll 生效; run 是验证入口, 始终完整执行给真实结果。
+    if action.startswith("silent") and _already_signed_today():
+        log("今日已签到成功, 本次静默执行跳过 (不启动浏览器)")
+        return 0
+
+    accounts, cred_reason, missing = read_client_accounts()
+    if accounts:
+        log(f"凭据模式: 客户端凭据 ({cred_reason})")
+    elif missing:
+        log(f"凭据模式: 客户端凭据 (配置的账号未命中: {'、'.join(missing)}; {cred_reason})")
+    else:
+        log(f"凭据模式: 网页登录态 ({cred_reason})")
+
+    if not accounts:
+        if missing:
+            # 配置点名的账号一个都读不到: 绝不回落到「去签别的号」, 直接如实汇报。
+            # (配了 A 和 B 却签了 C, 比什么都不签更糟)
+            results = [(2, _missing_result(n), n) for n in missing]
+            code, agg = _aggregate_results(results)
+            log(f"配置里的账号全部读不到登录态: {'、'.join(missing)}")
+            notify("豆包签到", _notify_brief(agg["report"]))
+            emit(agg, action)
+            return code
+        # 没有客户端凭据: 走网页登录态单账号路径 (历史行为)
+        code, _out = _checkin_one(start_url, action, None, None, standalone=True)
+        return code
+
+    if len(accounts) == 1 and not missing:
+        # 单账号: 不写 profile 字段, 日志与 last-result.json 格式和旧版完全一致
+        code, _out = _checkin_one(start_url, action, accounts[0]["cookies"], None, standalone=True)
+        return code
+
+    log(f"多账号模式: 依次签到 {len(accounts) + len(missing)} 个账号")
+    results: list[tuple[int, dict, str]] = []
+    for acc in accounts:
+        if budget_exhausted():
+            out = {"result": "TIMEOUT", "report": REPORTS["TIMEOUT"], "profile": acc["label"]}
+            log(f"账号「{acc['label']}」跳过: 本轮时间预算已用完")
+            _log_result(out)
+            results.append((1, out, acc["label"]))
+            continue
+        log(f"—— 账号「{acc['label']}」(Profile {acc['profile']}) 开始 ——")
+        code, out = _checkin_one(start_url, action, acc["cookies"], acc["label"], standalone=False)
+        _log_result(out)
+        results.append((code, out, acc["label"]))
+
+    # 配置里点名、但本机读不到登录态的账号: 必须显式汇报, 不能静默跳过
+    for name in missing:
+        out = _missing_result(name)
+        log(f"账号「{name}」读不到登录态: 已跳过, 请在豆包电脑版里重新登录该账号")
+        _log_result(out)
+        results.append((2, out, name))
+
+    code, agg = _aggregate_results(results)
+    log(f"多账号汇总: {agg['report']}")
+    notify("豆包签到", _notify_brief(agg["report"]))
+    emit(agg, action)
+    return code
+
+
+def _scan_profiles_metadata() -> list[dict]:
+    """只读 Cookie 库元数据 (不解密、不碰钥匙串): 有哪些 Profile、各有多少条豆包 Cookie。
+
+    作为账号探测的降级通道: 解密失败时仍能告诉用户「本机有几个登录位置」,
+    但措辞必须诚实 —— 登录位置不等于账号数, 同一账号反复切换会留下多份记录。
+    """
+    import sqlite3
+    base = CLIENT_DATA_DIR
+    dbs: list[pathlib.Path] = []
+    if sys.platform == "darwin":
+        if base.exists():
+            dbs = [d / "Cookies" for d in sorted(base.glob("*")) if (d / "Cookies").is_file()]
+    elif sys.platform == "win32":
+        for root in _windows_client_roots():
+            dbs += [d for d in sorted(root.glob("*/Cookies")) + sorted(root.glob("*/Network/Cookies"))]
+    out: list[dict] = []
+    for db in dbs:
+        name = db.parent.name if db.parent.name != "Network" else db.parent.parent.name
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
+            try:
+                rows = con.execute(
+                    "SELECT COUNT(*), SUM(CASE WHEN expires_utc = 0 OR expires_utc > ? THEN 1 ELSE 0 END) "
+                    "FROM cookies WHERE host_key LIKE '%doubao%'",
+                    (int((time.time() + 11644473600) * 1_000_000),)).fetchone()
+            finally:
+                con.close()
+            total, alive = int(rows[0] or 0), int(rows[1] or 0)
+        except Exception:
+            continue
+        if total:
+            out.append({"profile": name, "cookies": total, "alive": alive})
+    return out
+
+
+def _uid_fp(cookies: list[dict]) -> str | None:
+    """从已解密的 Cookie 里取账号 uid 的指纹 (只返回哈希前 8 位, 不落明文)。"""
+    for c in cookies:
+        if c.get("name") == "__tea__ug__uid" and c.get("value"):
+            return hashlib.sha256(str(c["value"]).encode()).hexdigest()[:8]
+    return None
+
+
+def detect_accounts() -> dict:
+    """探测本机可签到的账号。
+
+    优先解密后按 uid 去重 (同一账号多个 Profile 只算一个, 保留 Cookie 最多的那份);
+    解密不可用时降级为「登录位置」清单, 并明确标注未经身份校验。
+    """
+    live, note = _read_client_accounts_live()
+    result: dict = {"configured": [a["profile"] for a in (load_accounts_config() or [])] or None,
+                    "multi_enabled": accounts_config_enabled()}
+    if live:
+        accounts: list[dict] = []
+        idx_by_uid: dict[str, int] = {}
+        for acc in live:
+            fp = _uid_fp(acc["cookies"])
+            entry = {"profile": acc["profile"], "label": acc["profile"],
+                     "uid_fp": fp, "cookies": len(acc["cookies"]), "duplicate_of": None}
+            if fp and fp in idx_by_uid:
+                i = idx_by_uid[fp]
+                # 同一账号留 Cookie 更全的那份, 另一份标记为重复 (不参与签到)
+                if entry["cookies"] > accounts[i]["cookies"]:
+                    accounts[i]["duplicate_of"] = entry["profile"]
+                    accounts[i] = entry
+                else:
+                    entry["duplicate_of"] = accounts[i]["profile"]
+                    accounts.append(entry)
+                continue
+            if fp:
+                idx_by_uid[fp] = len(accounts)
+            accounts.append(entry)
+        result.update({"count": len([a for a in accounts if not a["duplicate_of"]]),
+                       "mode": "uid", "accounts": accounts, "note": note})
+    else:
+        meta = _scan_profiles_metadata()
+        result.update({"count": len(meta), "mode": "profile",
+                       "accounts": [{"profile": m["profile"], "label": m["profile"],
+                                     "uid_fp": None, "cookies": m["cookies"],
+                                     "alive": m["alive"], "duplicate_of": None} for m in meta],
+                       "note": note + "; 已降级为只读元数据, 未做登录身份校验"})
+    return result
+
+
+def accounts_cmd(args) -> int:
+    """accounts 子命令: 探测 / 开启 / 关闭 / 查看多账号配置。
+
+    只读写 data/accounts.json, 不碰 last-result.json —— 否则会把签到汇报冲掉。
+    """
+    if args.enable is not None:
+        wanted = [x.strip() for x in str(args.enable).replace("，", ",").split(",") if x.strip()]
+        if not wanted:
+            print("错误: --enable 后面要跟 Profile 名, 多个用逗号分隔, 例如 \"Default,Profile 1\"")
+            return 1
+        info = detect_accounts()
+        known = {str(a["profile"]).lower(): a["profile"] for a in info.get("accounts", [])}
+        unknown = [w for w in wanted if w.lower() not in known]
+        if unknown:
+            avail = "、".join(sorted(known.values())) or "（本机没检测到任何可读账号）"
+            print(f"错误: 本机找不到这些 Profile: {', '.join(unknown)}")
+            print(f"当前可用: {avail}")
+            return 1
+        accounts = [{"profile": known[w.lower()], "label": known[w.lower()]} for w in wanted]
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        ACCOUNTS_FILE.write_text(
+            json.dumps({"version": 1, "accounts": accounts}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8")
+        print(f"已开启多账号签到: {'、'.join(a['profile'] for a in accounts)}")
+        print(f"配置: {ACCOUNTS_FILE}")
+        print("下一轮签到（或手动 run）会按此逐个签到; 删除该文件即恢复单账号。")
+        return 0
+
+    if args.disable:
+        if ACCOUNTS_FILE.exists():
+            ACCOUNTS_FILE.unlink()
+            print("已关闭多账号, 恢复为只签一个账号 (第一个有登录态的 Profile)")
+        else:
+            print("当前本来就是单账号模式, 无需关闭")
+        return 0
+
+    info = detect_accounts()
+    if args.status:
+        cfg = load_accounts_config()
+        scope = "、".join(a["profile"] if a["label"] == a["profile"] else f"{a['label']}({a['profile']})"
+                          for a in cfg) if cfg else ""
+        print(f"账号范围: {'多账号 — ' + scope if cfg else '单账号(默认)'}")
+        print(f"本机检测到: {info.get('count', 0)} 个账号 (口径: "
+              f"{'按登录身份去重' if info.get('mode') == 'uid' else '按登录位置, 未校验身份'})")
+        print(f"配置文件: {ACCOUNTS_FILE}{'' if ACCOUNTS_FILE.exists() else ' (不存在)'}")
+        print("JSON: " + json.dumps({"mode": info.get("mode"), "count": info.get("count"),
+                                    "configured": info.get("configured")}, ensure_ascii=False))
+        return 0
+
+    # 默认 (含 --detect): 人读清单 + 末尾一行 JSON 给 AI 解析
+    n = info.get("count", 0)
+    if info.get("mode") == "uid":
+        print(f"【账号】检测到 {n} 个可签到账号 (已按登录身份去重)")
+    else:
+        print(f"【登录位置】检测到 {n} 个带登录数据的 Profile (未能校验身份, 可能含同一账号的旧记录)")
+    for i, a in enumerate(info.get("accounts", []), 1):
+        dup = f"  ← 与 {a['duplicate_of']} 是同一账号, 已合并" if a.get("duplicate_of") else ""
+        fp = f"  uid {a['uid_fp']}" if a.get("uid_fp") else ""
+        print(f"  {i}. {a['profile']}   {a['cookies']} 条 cookie{fp}{dup}")
+    cfg = info.get("configured")
+    print(f"【配置】{'多账号: ' + '、'.join(cfg) if cfg else '未启用 (默认只签一个账号)'}")
+    if info.get("note"):
+        print(f"【说明】{info['note']}")
+    print("JSON: " + json.dumps(info, ensure_ascii=False))
+    return 0
 
 
 def login() -> int:
@@ -1145,13 +1586,28 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="豆包自动签到")
     ap.add_argument(
         "action",
-        choices=["login", "run", "silent", "silent-poll", "doctor"],
+        choices=["login", "run", "silent", "silent-poll", "doctor", "accounts"],
         help="run=签到(stdout), silent=签到(写日志), silent-poll=轮询补签(空跑不落盘), "
-             "doctor=离线自检, login=手动登录(备用)",
+             "doctor=离线自检, login=手动登录(备用), accounts=查看/开启多账号",
     )
     ap.add_argument("--url", default=ACTIVITY_URL, help="签到活动页直链 (默认 agent-explore)")
     ap.add_argument("--elevated-child", action="store_true", help=argparse.SUPPRESS)
+    ag = ap.add_mutually_exclusive_group()
+    ag.add_argument("--detect", action="store_true",
+                    help="accounts: 列出本机可签到的账号 (只读, 不签到)")
+    ag.add_argument("--enable", metavar="LIST",
+                    help="accounts: 开启多账号签到, 逗号分隔 Profile 名, 如「Default,Profile 1」")
+    ag.add_argument("--disable", action="store_true",
+                    help="accounts: 关闭多账号, 恢复只签一个账号")
+    ag.add_argument("--status", action="store_true",
+                    help="accounts: 查看当前账号范围")
     args = ap.parse_args()
+    if args.action == "accounts":
+        try:
+            return accounts_cmd(args)
+        except Exception as exc:
+            print(f"账号命令执行失败: {type(exc).__name__}: {exc}")
+            return 1
     if args.action == "login":
         return login()
     if args.action == "doctor":
